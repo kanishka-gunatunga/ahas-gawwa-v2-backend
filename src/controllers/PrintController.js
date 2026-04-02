@@ -1,0 +1,95 @@
+const PrintJob = require('../models/PrintJob');
+const Order = require('../models/Order');
+const Payment = require('../models/Payment');
+const Customer = require('../models/Customer');
+const Product = require('../models/Product');
+const Variation = require('../models/Variation');
+const VariationOption = require('../models/VariationOption');
+const OrderItem = require('../models/OrderItem');
+const OrderItemModification = require('../models/OrderItemModification');
+const ModificationItem = require('../models/ModificationItem');
+const Branch = require('../models/Branch');
+const { orderBelongsToRequesterBranch } = require('../utils/orderBranchScope');
+
+exports.getPendingJobs = async (req, res) => {
+    try {
+        const jobs = await PrintJob.findAll({
+            where: { status: 'pending' },
+            order: [['createdAt', 'ASC']]
+        });
+        console.log(`[PrintController] Found ${jobs.length} pending jobs`);
+        res.json(jobs);
+    } catch (error) {
+        console.error('[PrintController] Error in getPendingJobs:', error);
+        res.status(500).json({ message: error.message });
+    }
+};
+
+exports.updateStatus = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { status } = req.body;
+
+        const job = await PrintJob.findByPk(id);
+        if (!job) return res.status(404).json({ message: 'Print job not found' });
+
+        await job.update({ status: status || 'completed' });
+        res.json({ message: 'Print job updated', job });
+    } catch (error) {
+        res.status(500).json({ message: error.message });
+    }
+};
+
+exports.createManualPrintJob = async (req, res) => {
+    try {
+        const { orderId, paymentId, type } = req.body;
+
+        const User = require('../models/User');
+        const order = await Order.findByPk(orderId, {
+            include: [
+                { model: Customer, as: 'customer' },
+                { model: User, as: 'user', attributes: ['name', 'username'] },
+                {
+                    model: OrderItem,
+                    as: 'items',
+                    include: [
+                        { model: Product, as: 'product' },
+                        { model: VariationOption, as: 'variation' },
+                        {
+                            model: OrderItemModification,
+                            as: 'modifications',
+                            include: [{ model: ModificationItem, as: 'modification' }]
+                        }
+                    ]
+                }
+            ]
+        });
+
+        if (!order) return res.status(404).json({ message: 'Order not found' });
+        if (!(await orderBelongsToRequesterBranch(req, order))) {
+            return res.status(404).json({ message: 'Order not found' });
+        }
+        const payment = paymentId ? await Payment.findByPk(paymentId) : null;
+
+        const UserDetail = require('../models/UserDetail');
+        const userDetail = await UserDetail.findOne({ where: { userId: req.user.id } });
+        const branchId = userDetail?.branchId || 1;
+        const branch = await Branch.findByPk(branchId);
+
+        const templateService = require('../services/templateService');
+        const content = templateService.generateReceiptHtml(order, payment, branch);
+
+        const job = await PrintJob.create({
+            order_id: orderId,
+            payment_id: paymentId || null,
+            printer_name: 'Main_Counter_Printer',
+            content,
+            type: type || 'receipt',
+            status: 'pending'
+        });
+
+        res.status(201).json(job);
+    } catch (error) {
+        res.status(500).json({ message: error.message });
+    }
+};
